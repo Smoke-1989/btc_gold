@@ -6,16 +6,28 @@ import secrets
 import platform
 import signal
 import ctypes
+import hashlib
+import binascii
 from multiprocessing import Process, Value, cpu_count, Event, Manager, Array
 from datetime import datetime
+
+# --- CONFIGURAÇÃO DE ALTA PERFORMANCE ---
+# Desativa garbage collector automático dentro dos workers para evitar pausas
+import gc
 
 # --- VERIFICAÇÃO DE DEPENDÊNCIAS CRÍTICAS ---
 try:
     from coincurve import PrivateKey
-    BACKEND = "COINCURVE (C-BINDING / FAST)"
 except ImportError:
-    print("\n[ERRO] A biblioteca 'coincurve' é obrigatória para performance profissional.")
-    print("Instale: pip install coincurve")
+    print("\n[CRITICAL ERROR] 'coincurve' não encontrado.")
+    print("Execute: pip install -r requirements.txt")
+    sys.exit()
+
+try:
+    import base58
+except ImportError:
+    print("\n[CRITICAL ERROR] 'base58' não encontrado.")
+    print("Execute: pip install -r requirements.txt")
     sys.exit()
 
 try:
@@ -25,7 +37,6 @@ except ImportError:
     class Fore: RED=GREEN=YELLOW=CYAN=MAGENTA=WHITE=RESET=""
     class Style: BRIGHT=DIM=NORMAL=""
 
-# Tenta importar psutil para info de hardware
 try:
     import psutil
     HAS_PSUTIL = True
@@ -43,7 +54,6 @@ MAX_KEY_LIMIT = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD03641
 def detect_system_specs():
     print(f"{Fore.CYAN}[SYSTEM DIAGNOSTICS]..........................")
     uname = platform.uname()
-    cpu_name = uname.processor
     logical_cores = os.cpu_count()
     
     ram_info = "N/A"
@@ -53,182 +63,208 @@ def detect_system_specs():
         ram_info = f"{ram_total} GB"
     
     print(f"{Fore.WHITE}[*] OS      : {uname.system} {uname.release}")
-    print(f"{Fore.WHITE}[*] CPU     : {cpu_name}")
-    print(f"{Fore.WHITE}[*] THREADS : {logical_cores} (Ativas)")
+    print(f"{Fore.WHITE}[*] CPU     : {uname.processor}")
+    print(f"{Fore.WHITE}[*] CORES   : {logical_cores} (Logical)")
     print(f"{Fore.WHITE}[*] RAM     : {ram_info}")
     print(f"{Fore.CYAN}................................................")
     return logical_cores
 
-# --- GERENCIAMENTO DE DADOS ---
-class TargetDatabase:
-    def __init__(self):
-        self.addresses = set()
-        self.pubkeys = set()
+# --- LOADERS INTELIGENTES ---
+def load_targets_binary(file_path):
+    """
+    Carrega endereços e converte IMEDIATAMENTE para HASH160 (bytes).
+    Evita conversão base58 dentro do loop de mineração.
+    """
+    targets = set()
+    raw_count = 0
     
-    def load(self):
-        if not os.path.exists(TARGET_FILE):
-            print(f"{Fore.RED}[!] ERRO: '{TARGET_FILE}' não encontrado.")
-            return False
-        
-        print(f"{Fore.YELLOW}[*] Carregando banco de dados de alvos...")
-        try:
-            with open(TARGET_FILE, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line: continue
-                    if line.startswith("1") or line.startswith("3") or line.startswith("bc1"):
-                        self.addresses.add(line)
-                    else:
-                        self.pubkeys.add(line)
-            
-            print(f"{Fore.GREEN}[OK] Database Pronta: {len(self.addresses)} Endereços | {len(self.pubkeys)} PubKeys")
-            return True
-        except Exception as e:
-            print(f"{Fore.RED}[!] Erro ao ler arquivo: {e}")
-            return False
+    if not os.path.exists(file_path):
+        return targets, 0
 
-# --- WORKER DE MINERAÇÃO ---
-def worker_engine(start_base, multiplier, mode, target_addresses, target_pubkeys, counter, found_event, stop_event, stop_on_find, found_list, lock, shared_key_display, core_id):
-    """
-    Motor Híbrido: Verifica Compressed e Uncompressed.
-    """
-    import hashlib, base58
+    print(f"{Fore.YELLOW}[*] Processando Database (Binary Mode)...")
     
+    try:
+        with open(file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                
+                # Suporte apenas a Legacy Addresses (P2PKH - Começam com 1)
+                # Script ignora Bech32 por enquanto para maximizar velocidade em legacy
+                if line.startswith("1"):
+                    try:
+                        # Decode Base58 -> Checksum Validation -> Remove Version Byte (1 byte)
+                        # Resultado: 20 bytes do Hash160
+                        full_payload = base58.b58decode_check(line)
+                        h160 = full_payload[1:] # Remove prefixo 0x00
+                        targets.add(h160)
+                        raw_count += 1
+                    except Exception:
+                        continue
+                        
+        print(f"{Fore.GREEN}[OK] Otimizado: {len(targets)} Alvos únicos (HASH160 Bytes)")
+        return targets, raw_count
+    except Exception as e:
+        print(f"{Fore.RED}[!] Erro ao processar alvos: {e}")
+        return set(), 0
+
+# --- ENGINE OTIMIZADA (V2.0) ---
+def worker_engine(start_base, multiplier, mode, target_set, counter, found_event, stop_event, stop_on_find, found_list, lock, shared_key_display, core_id, scan_mode):
+    """
+    ENGINE V2.0:
+    - Zero conversões de string no loop.
+    - Zero conversões base58 no loop.
+    - Comparação Bytes vs Bytes (Hash160).
+    - Pipeline dedicado: SHA256 -> RIPEMD160.
+    """
+    
+    # Imports locais para velocidade
+    import hashlib
+    
+    # Pré-bind de funções globais para locais (Small Speedup)
     sha256 = hashlib.sha256
-    new_ripemd160 = lambda: hashlib.new('ripemd160')
-    b58encode = base58.b58encode_check
-    PREFIX = b'\x00'
+    new_ripemd = lambda: hashlib.new('ripemd160')
+    
+    # Configurações de Scan
+    check_compressed = (scan_mode in [1, 3])
+    check_uncompressed = (scan_mode in [2, 3])
     
     current = start_base
-    offset_count = 0
     
+    # Cache local do set (evita overhead de IPC se fosse compartilhado, mas aqui é Copy-on-Write)
+    local_targets = target_set
+    
+    # Prepara buffer de exibição
+    last_update = time.time()
+    
+    # Desativa GC para loop crítico
+    gc.disable()
+    
+    batch_size = 1000
+    batch_counter = 0
+
     while not stop_event.is_set():
         if stop_on_find and found_event.is_set(): 
             break
 
+        # Geração da Chave Privada
+        # Utiliza inteiros nativos do Python (arbitrary precision) que são rápidos
         if mode == "RANDOM":
             current = int.from_bytes(secrets.token_bytes(32), 'big')
-        elif current > MAX_KEY_LIMIT:
-            offset_count += 1
-            current = start_base + (offset_count * 10000000)
-
+        
         try:
+            # Coincurve é wrapper C (libsecp256k1), extremamente rápido
             priv_bytes = current.to_bytes(32, 'big')
             pk = PrivateKey(priv_bytes)
         except:
-            if mode != "RANDOM": current = 1
+            if mode != "RANDOM": current += 1
             continue
 
-        # --- COMPRESSED FLOW ---
-        pub_comp_bytes = pk.public_key.format(compressed=True)
-        
-        if target_pubkeys and pub_comp_bytes.hex() in target_pubkeys:
-            save_discovery(current, pub_comp_bytes.hex(), "PubKey (Compressed)", found_list, lock)
-            if stop_on_find: found_event.set()
-
-        if target_addresses:
-            h160 = new_ripemd160()
-            h160.update(sha256(pub_comp_bytes).digest())
-            addr_comp = b58encode(PREFIX + h160.digest()).decode()
+        # --- FLUXO COMPRIMIDO ---
+        if check_compressed:
+            # Obtém bytes puros (33 bytes)
+            pub_bytes_c = pk.public_key.format(compressed=True)
             
-            if addr_comp in target_addresses:
-                save_discovery(current, addr_comp, "Address (Compressed)", found_list, lock)
-                if stop_on_find: found_event.set()
-
-        # --- UNCOMPRESSED FLOW ---
-        pub_uncomp_bytes = pk.public_key.format(compressed=False)
-        
-        if target_pubkeys and pub_uncomp_bytes.hex() in target_pubkeys:
-            save_discovery(current, pub_uncomp_bytes.hex(), "PubKey (Uncompressed)", found_list, lock)
-            if stop_on_find: found_event.set()
-
-        if target_addresses:
-            h160_u = new_ripemd160()
-            h160_u.update(sha256(pub_uncomp_bytes).digest())
-            addr_uncomp = b58encode(PREFIX + h160_u.digest()).decode()
+            # Hash160 (SHA256 -> RIPEMD160)
+            r = new_ripemd()
+            r.update(sha256(pub_bytes_c).digest())
+            h160_c = r.digest()
             
-            if addr_uncomp in target_addresses:
-                save_discovery(current, addr_uncomp, "Address (Uncompressed)", found_list, lock)
-                if stop_on_find: found_event.set()
+            # COMPARAÇÃO BINÁRIA (O(1) lookup)
+            if h160_c in local_targets:
+                found_event.set()
+                save_discovery_v2(current, h160_c, "Compressed", found_list, lock)
 
-        # --- MOVIMENTO ---
+        # --- FLUXO DESCOMPRIMIDO ---
+        if check_uncompressed:
+            # Obtém bytes puros (65 bytes)
+            pub_bytes_u = pk.public_key.format(compressed=False)
+            
+            # Hash160
+            r = new_ripemd()
+            r.update(sha256(pub_bytes_u).digest())
+            h160_u = r.digest()
+            
+            # COMPARAÇÃO BINÁRIA
+            if h160_u in local_targets:
+                found_event.set()
+                save_discovery_v2(current, h160_u, "Uncompressed", found_list, lock)
+
+        # --- ATUALIZAÇÃO E MOVIMENTO ---
+        batch_counter += 1
+        if batch_counter >= batch_size:
+            with counter.get_lock():
+                counter.value += batch_size
+            
+            if core_id == 0:
+                # Atualiza display a cada ~0.2s para não spammar lock
+                now = time.time()
+                if now - last_update > 0.2:
+                    try:
+                        hex_str = format(current, '064x')
+                        shared_key_display.value = hex_str.encode('utf-8')
+                    except: pass
+                    last_update = now
+            
+            # Reativa GC brevemente para limpar memória se necessário
+            # gc.collect() # (Opcional: Geralmente não necessário se não criamos lixo no loop)
+            batch_counter = 0
+
+        # Movimento Matemático
         if mode == "GEOMETRIC":
-            if multiplier > 1:
-                current = current * multiplier
-            else:
-                current += 1
+            current *= multiplier
         elif mode == "LINEAR":
             current += multiplier
 
-        # --- ATUALIZAÇÃO ---
-        if current % 1000 == 0:
-            with counter.get_lock(): counter.value += 1000
-            if core_id == 0:
-                try:
-                    hex_str = format(current, '064x')
-                    shared_key_display.value = hex_str.encode('utf-8')
-                except: pass
-
-# --- SISTEMA DE SALVAMENTO (WIF DUPLO) ---
-def save_discovery(private_int, public_data, type_found, found_list, lock):
+# --- SISTEMA DE SALVAMENTO (RECONSTRUÇÃO) ---
+def save_discovery_v2(private_int, h160_bytes, type_found, found_list, lock):
+    """
+    Reconstrói os dados legíveis apenas quando encontra algo.
+    """
     priv_hex = format(private_int, '064x')
     
     with lock:
         if priv_hex in found_list: return
         found_list.append(priv_hex)
     
-    import hashlib, base58
+    # Reconstrução para display (Lento, mas só roda 1 vez na vida)
+    version_byte = b'\x00'
+    payload = version_byte + h160_bytes
+    checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    address_str = base58.b58encode(payload + checksum).decode()
     
-    # 1. WIF COMPRESSED (Sufixo 01) - Inicia com K ou L
-    extended_comp = bytes.fromhex("80" + priv_hex + "01")
-    first_c = hashlib.sha256(extended_comp).digest()
-    chk_c = hashlib.sha256(first_c).digest()[:4]
-    wif_compressed = base58.b58encode(extended_comp + chk_c).decode()
-
-    # 2. WIF UNCOMPRESSED (Sem Sufixo) - Inicia com 5
-    extended_uncomp = bytes.fromhex("80" + priv_hex)
-    first_u = hashlib.sha256(extended_uncomp).digest()
-    chk_u = hashlib.sha256(first_u).digest()[:4]
-    wif_uncompressed = base58.b58encode(extended_uncomp + chk_u).decode()
+    # Gera WIFs
+    wif_c = generate_wif(priv_hex, compressed=True)
+    wif_u = generate_wif(priv_hex, compressed=False)
 
     print(f"\n{Fore.MAGENTA}{Style.BRIGHT}" + "█"*75)
-    print(f"      CRITICAL HIT: ALVO LOCALIZADO")
+    print(f"      💰 JACKPOT: CHAVE ENCONTRADA! 💰")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}" + "█"*75)
-    print(f"{Fore.WHITE}[+] TIPO : {type_found}")
-    print(f"{Fore.WHITE}[+] ALVO : {Fore.CYAN}{public_data}")
-    print(f"{Fore.WHITE}[+] HEX  : {Fore.GREEN}{priv_hex}")
-    print(f"{Fore.WHITE}[+] DEC  : {private_int}")
-    print(f"{Fore.YELLOW}[+] WIF (Compressed)   : {wif_compressed}")
-    print(f"{Fore.YELLOW}[+] WIF (Uncompressed) : {wif_uncompressed}")
+    print(f"{Fore.WHITE}[+] TIPO     : {Fore.CYAN}{type_found}")
+    print(f"{Fore.WHITE}[+] ENDEREÇO : {Fore.GREEN}{address_str}")
+    print(f"{Fore.WHITE}[+] HEX      : {Fore.YELLOW}{priv_hex}")
+    print(f"{Fore.WHITE}[+] INT      : {private_int}")
+    print(f"{Fore.BLUE}[+] WIF (C)  : {wif_c}")
+    print(f"{Fore.BLUE}[+] WIF (U)  : {wif_u}")
     print(f"{Fore.MAGENTA}" + "█"*75 + f"{Style.RESET_ALL}\n")
 
     with open(FOUND_FILE, "a") as f:
-        f.write(f"[{datetime.now()}] TYPE: {type_found}\n")
-        f.write(f"ALVO: {public_data}\n")
-        f.write(f"HEX : {priv_hex}\n")
-        f.write(f"WIF C: {wif_compressed}\n")
-        f.write(f"WIF U: {wif_uncompressed}\n")
+        f.write(f"[{datetime.now()}] FOUND: {address_str} ({type_found})\n")
+        f.write(f"HEX: {priv_hex}\n")
+        f.write(f"WIF C: {wif_c}\n")
+        f.write(f"WIF U: {wif_u}\n")
         f.write("-" * 50 + "\n")
 
-# --- SMART SEEDS ---
-def get_smart_seeds(num_cores, multiplier):
-    bases = []
-    candidate = 1
-    while len(bases) < num_cores:
-        is_redundant = False
-        for b in bases:
-            if candidate % b == 0:
-                ratio = candidate // b
-                temp = ratio
-                while temp > 1 and temp % multiplier == 0:
-                    temp //= multiplier
-                if temp == 1:
-                    is_redundant = True
-                    break
-        if not is_redundant:
-            bases.append(candidate)
-        candidate += 1
-    return bases
+def generate_wif(priv_hex, compressed=True):
+    import hashlib, base58
+    if compressed:
+        extended = bytes.fromhex("80" + priv_hex + "01")
+    else:
+        extended = bytes.fromhex("80" + priv_hex)
+    
+    first = hashlib.sha256(extended).digest()
+    chk = hashlib.sha256(first).digest()[:4]
+    return base58.b58encode(extended + chk).decode()
 
 # --- CHECKPOINTS ---
 def save_checkpoint(val):
@@ -247,146 +283,153 @@ def load_checkpoint():
 # --- MAIN ---
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
-    if os.name == 'nt': os.system('title BTC GOLD EDITION')
+    if os.name == 'nt': os.system('title BTC GOLD PROFESSIONAL v2.0')
 
     print(f"{Fore.YELLOW}{Style.BRIGHT}")
     print(r"""
-    ██████╗  ██████╗ ██╗     ██████╗ 
-   ██╔════╝ ██╔═══██╗██║     ██╔══██╗
-   ██║  ███╗██║   ██║██║     ██║  ██║
-   ██║   ██║██║   ██║██║     ██║  ██║
-   ╚██████╔╝╚██████╔╝███████╗██████╔╝
-    ╚═════╝  ╚═════╝ ╚══════╝╚═════╝ 
-          GOLD EDITION v5.0
+    ██████╗ ████████╗██╗██████╗ ███████╗
+    ██╔══██╗╚══██╔══╝██║██╔══██╗██╔════╝
+    ██████╔╝   ██║   ██║██║  ██║█████╗  
+    ██╔══██╗   ██║   ██║██║  ██║██╔══╝  
+    ██████╔╝   ██║   ██║██████╔╝███████╗
+    ╚═════╝    ╚═╝   ╚═╝╚═════╝ ╚══════╝
+    PROFESSIONAL EDITION v2.0 (BINARY ENGINE)
     """)
     
-    logical_cores = detect_system_specs()
-    print("-" * 60)
-
-    manager = Manager()
-    found_list = manager.list()
-    lock = manager.Lock()
-    shared_key_display = Array('c', 66) 
-    shared_key_display.value = b"Carregando..."
+    cores = detect_system_specs()
     
-    found_event = Event()
-    stop_event = Event()
-
-    db = TargetDatabase()
-    if not db.load():
-        with open(TARGET_FILE, 'w') as f: 
+    # 1. Carregamento Otimizado
+    target_set, count = load_targets_binary(TARGET_FILE)
+    if count == 0:
+        print(f"{Fore.RED}[!] Nenhum alvo válido encontrado em '{TARGET_FILE}'.")
+        print("Crie o arquivo com endereços P2PKH (começando com 1).")
+        with open(TARGET_FILE, 'w') as f:
             f.write("1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH\n")
-            f.write("1Hz96kJKF2HLPGCfHzwnJPwsfJnjZVfXxF\n")
-        print(f"{Fore.YELLOW}[AVISO] Arquivo '{TARGET_FILE}' criado.")
-        return
+        sys.exit()
 
-    print(f"\n{Fore.YELLOW}[MODO DE OPERAÇÃO]")
-    print(f"{Fore.WHITE}1. {Fore.CYAN}GEOMÉTRICO {Fore.WHITE}(Multiplicação Exponencial)")
-    print(f"{Fore.WHITE}2. {Fore.CYAN}SEQUENCIAL {Fore.WHITE}(Linear / Range Attack)")
-    print(f"{Fore.WHITE}3. {Fore.CYAN}RANDOM {Fore.WHITE}(Aleatório)")
+    # 2. Configuração de Modo de Scan
+    print(f"\n{Fore.YELLOW}[CONFIGURAÇÃO DE ALVO]")
+    print(f"{Fore.WHITE}[1] Apenas Comprimidos (Padrão Moderno - Mais Rápido)")
+    print(f"{Fore.WHITE}[2] Apenas Descomprimidos (Legado)")
+    print(f"{Fore.WHITE}[3] AMBOS (Verificação Dupla - Mais Lento)")
     
     try:
-        choice = input(f"\n{Fore.GREEN}>> Selecione: ")
-    except KeyboardInterrupt: sys.exit()
+        scan_choice = input(f"{Fore.GREEN}>> Escolha [1-3]: ").strip()
+        scan_mode = int(scan_choice) if scan_choice in ['1','2','3'] else 1
+    except: scan_mode = 1
+
+    # 3. Configuração de Movimento
+    print(f"\n{Fore.YELLOW}[MODO DE OPERAÇÃO]")
+    print(f"{Fore.WHITE}1. {Fore.CYAN}SEQUENCIAL {Fore.WHITE}(Range Attack)")
+    print(f"{Fore.WHITE}2. {Fore.CYAN}RANDOM {Fore.WHITE}(Sorte Absoluta)")
+    print(f"{Fore.WHITE}3. {Fore.CYAN}GEOMÉTRICO {Fore.WHITE}(Multiplicação)")
+    
+    try:
+        mode_choice = input(f"\n{Fore.GREEN}>> Selecione: ").strip()
+    except: sys.exit()
 
     start_num = 1
     mode = "LINEAR"
-    multiplier = 1 
+    multiplier = 1
 
-    if choice == "1":
-        mode = "GEOMETRIC"
-        print(f"\n{Fore.YELLOW}[CONFIG GEOMÉTRICA]")
-        try: 
-            multiplier = int(input(f"{Fore.GREEN}>> Fator Multiplicador (ex: 2, 100): "))
-            if multiplier < 2: multiplier = 2
-        except: multiplier = 100
-    
-    elif choice == "2":
+    if mode_choice == "1":
         mode = "LINEAR"
         print(f"\n{Fore.YELLOW}[CONFIG SEQUENCIAL]")
-        print("Digite o Bit Inicial (ex: 66) OU deixe vazio para usar Checkpoint.")
-        bit_input = input(f"{Fore.GREEN}>> Bit Inicial: ")
+        print("Deixe vazio para continuar do Checkpoint ou digite o BIT (ex: 66).")
+        bit_in = input(f"{Fore.GREEN}>> Bit Inicial: ")
         
-        if bit_input.strip():
-            try: start_num = 2 ** (int(bit_input) - 1)
+        if bit_in.strip():
+            try: start_num = 2 ** (int(bit_in) - 1)
             except: start_num = 1
         else:
             cp = load_checkpoint()
             if cp > 1:
-                if input(f"Retomar checkpoint {cp}? (s/n): ").lower() == 's': start_num = cp
+                print(f"{Fore.CYAN}[*] Retomando do checkpoint: {cp}")
+                start_num = cp
 
-        try:
-            stride_in = input(f"{Fore.GREEN}>> Pulo/Stride (Padrão 1): ")
-            multiplier = int(stride_in) if stride_in else 1
-        except: multiplier = 1
+        # Distribuição de Carga para Sequencial
+        # Cada core pega um range: Core 0 (0..1M), Core 1 (1M..2M)...
+        # Para evitar overlap, usamos um "Stride" gigante
+        # Mas a implementação mais simples é cada worker ter seu offset fixo
+        # E todos incrementarem por (CORES * 1)
+        multiplier = cores
 
-    elif choice == "3":
+    elif mode_choice == "2":
         mode = "RANDOM"
-    
-    stop_on_find = input(f"\n{Fore.YELLOW}[?] Parar ao encontrar? (s/n): ").lower() == 's'
 
+    elif mode_choice == "3":
+        mode = "GEOMETRIC"
+        multiplier = 2 # Padrão dobrar
+
+    # 4. Execução
+    manager = Manager()
+    found_list = manager.list()
+    lock = manager.Lock()
+    found_event = Event()
+    stop_event = Event()
     counter = Value('L', 0)
+    shared_key_display = Array('c', 66)
+    shared_key_display.value = b"Starting..."
+
+    print(f"\n{Fore.YELLOW}[*] INICIANDO ENGINE V2.0 EM {cores} NÚCLEOS...")
+    
     processes = []
     
-    print(f"\n{Fore.YELLOW}[*] Iniciando {logical_cores} Workers (WIF Duplo Ativado)...")
-
-    seeds = []
-    if mode == "GEOMETRIC":
-        seeds = get_smart_seeds(logical_cores, multiplier)
-    else:
-        for i in range(logical_cores): seeds.append(start_num + (i * multiplier))
-
-    for i in range(logical_cores):
-        real_multiplier = multiplier
-        if mode == "LINEAR":
-            real_multiplier = logical_cores * multiplier
-
+    # Distribuição inicial das sementes
+    for i in range(cores):
+        # Seed inicial diferente para cada worker
+        worker_start = start_num + i 
+        
         p = Process(target=worker_engine, args=(
-            seeds[i], real_multiplier, mode, db.addresses, db.pubkeys, 
-            counter, found_event, stop_event, stop_on_find, found_list, lock, shared_key_display, i
+            worker_start, multiplier, mode, target_set, counter, 
+            found_event, stop_event, True, found_list, lock, shared_key_display, i, scan_mode
         ))
         p.daemon = True
         p.start()
         processes.append(p)
 
     start_time = time.time()
+    
     try:
         while True:
-            if stop_event.is_set(): break
-            if stop_on_find and found_event.is_set():
-                time.sleep(1)
+            time.sleep(0.5)
+            if found_event.is_set():
+                time.sleep(2) # Espera printar
                 break
-            
-            time.sleep(0.2)
+                
             elapsed = time.time() - start_time
             total = counter.value
-            try: hex_view = shared_key_display.value.decode('utf-8')
-            except: hex_view = "SYNC..."
-
+            
             if elapsed > 0:
                 hps = total / elapsed
-                sys.stdout.write(
-                    f"\r{Fore.YELLOW}[RUNNING] "
-                    f"{Fore.WHITE}Speed: {Fore.GREEN}{hps:,.0f} keys/s "
-                    f"{Fore.WHITE}| Total: {total:,} "
-                    f"{Fore.WHITE}| Mode: {Fore.CYAN}{mode} (x{multiplier})\n"
-                    f"{Fore.YELLOW}>> KEY: {Fore.WHITE}{hex_view}\033[F"
+                
+                # Formatação visual profissional
+                try: hex_view = shared_key_display.value.decode('utf-8')
+                except: hex_view = "SYNC"
+                
+                status_bar = (
+                    f"\r{Fore.BLUE}[RUNNING]{Fore.RESET} "
+                    f"Speed: {Fore.GREEN}{hps:,.0f} keys/s{Fore.RESET} | "
+                    f"Total: {Fore.WHITE}{total:,}{Fore.RESET} | "
+                    f"Last Key: {Fore.YELLOW}{hex_view[-16:]}...{Fore.RESET}"
                 )
+                sys.stdout.write(status_bar)
                 sys.stdout.flush()
                 
-                if mode == "LINEAR" and int(elapsed) % 30 == 0:
+                # Checkpoint automático a cada minuto
+                if mode == "LINEAR" and int(elapsed) % 60 == 0:
+                    # Salva a chave mais provável (base + total)
+                    # Não é exato por causa do multiprocessamento, mas serve de base segura
                     save_checkpoint(start_num + (total * multiplier))
 
     except KeyboardInterrupt:
-        print(f"\n\n{Fore.RED}[!] PARANDO SISTEMA...")
-        stop_event.set()
+        print(f"\n\n{Fore.RED}[!] Interrupção detectada. Salvando e saindo...")
         if mode == "LINEAR":
             save_checkpoint(start_num + (counter.value * multiplier))
-
+            
     finally:
         stop_event.set()
         for p in processes: p.terminate()
-        print(f"{Fore.CYAN}[*] Sistema Desligado.")
 
 if __name__ == "__main__":
     import multiprocessing
