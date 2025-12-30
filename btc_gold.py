@@ -67,44 +67,67 @@ def detect_system_specs():
     print(f"{Fore.CYAN}................................................")
     return logical_cores
 
-# --- LOADERS INTELIGENTES ---
-def load_targets_binary(file_path):
+# --- LOADERS UNIVERSAIS ---
+def load_targets(file_path, input_type):
     targets = set()
     raw_count = 0
     if not os.path.exists(file_path):
         return targets, 0
 
-    print(f"{Fore.YELLOW}[*] Processando Database (Binary Mode)...")
+    print(f"{Fore.YELLOW}[*] Processando Database ({input_type})...")
+    
     try:
         with open(file_path, 'r') as f:
             for line in f:
                 line = line.strip()
-                if not line or not line.startswith("1"): continue
+                if not line: continue
+                
+                h160_bytes = None
+                
                 try:
-                    full_payload = base58.b58decode_check(line)
-                    h160 = full_payload[1:] 
-                    targets.add(h160)
-                    raw_count += 1
+                    # TIPO 1: ENDEREÇOS (1A1z...)
+                    if input_type == "ADDRESS":
+                        if line.startswith("1"):
+                            full_payload = base58.b58decode_check(line)
+                            h160_bytes = full_payload[1:]
+
+                    # TIPO 2: HASH160 (Hex string: a1z2...)
+                    elif input_type == "HASH160":
+                        if len(line) == 40: # 20 bytes em hex
+                            h160_bytes = bytes.fromhex(line)
+
+                    # TIPO 3: PUBKEYS (Hex string: 02/03/04...)
+                    elif input_type == "PUBKEY":
+                        if len(line) > 60: # Simples check de comprimento
+                            pub_bytes = bytes.fromhex(line)
+                            # Converte PubKey -> SHA256 -> RIPEMD160
+                            sha = hashlib.sha256(pub_bytes).digest()
+                            rip = hashlib.new('ripemd160')
+                            rip.update(sha)
+                            h160_bytes = rip.digest()
+
+                    if h160_bytes:
+                        targets.add(h160_bytes)
+                        raw_count += 1
+                        
                 except: continue
-        print(f"{Fore.GREEN}[OK] Otimizado: {len(targets)} Alvos únicos (HASH160 Bytes)")
+
+        print(f"{Fore.GREEN}[OK] Database Carregada: {len(targets)} Alvos Únicos (Normalizados para HASH160)")
         return targets, raw_count
     except Exception as e:
         print(f"{Fore.RED}[!] Erro ao processar alvos: {e}")
         return set(), 0
 
-# --- ENGINE OTIMIZADA (V2.1 - TURBO) ---
+# --- ENGINE OTIMIZADA (V2.2 - UNIVERSAL) ---
 def worker_engine(start_val, multiplier, mode, target_set, counter, found_event, stop_event, stop_on_find, found_list, lock, shared_key_display, core_id, scan_mode, range_end=None):
     import hashlib
     
-    # Otimização Crítica: Funções Locais
     sha256 = hashlib.sha256
     new_ripemd = lambda: hashlib.new('ripemd160')
     
-    # Flags Booleanas são mais rápidas que IFs complexos
     check_compressed = (scan_mode in [1, 3])
     check_uncompressed = (scan_mode in [2, 3])
     
-    # Batch Processing para reduzir Overhead de Lock/IPC
     BATCH_SIZE = 10000 
     
     current = start_val
@@ -115,35 +138,23 @@ def worker_engine(start_val, multiplier, mode, target_set, counter, found_event,
     while not stop_event.is_set():
         if stop_on_find and found_event.is_set(): break
 
-        # --- GERAÇÃO DE LOTE (BATCH) ---
-        # Processamos N chaves antes de atualizar contadores globais
         for _ in range(BATCH_SIZE):
-            
-            # 1. Geração da Chave Privada
             if mode == "RANDOM":
                 if range_end:
-                    # Gera dentro do Range Específico (Mais lento que full random, mas necessário)
                     current = secrets.randbelow(range_end - start_val) + start_val
                 else:
-                    # Full Random (Mais rápido)
                     current = int.from_bytes(secrets.token_bytes(32), 'big')
             
-            # --- 2. Coincurve Fast Path ---
             try:
-                # Otimização: Evitar criar objeto PrivateKey completo se possível
-                # Usamos to_bytes(32) que é nativo e rápido
                 priv_bytes = current.to_bytes(32, 'big')
                 pk = PrivateKey(priv_bytes)
             except:
                 if mode != "RANDOM": current += 1
                 continue
 
-            # --- 3. Hashing Pipeline (O Coração da Performance) ---
-            
             # Compressed Path
             if check_compressed:
                 pub_c = pk.public_key.format(compressed=True)
-                # SHA256 -> RIPEMD160
                 r = new_ripemd()
                 r.update(sha256(pub_c).digest())
                 h160_c = r.digest()
@@ -165,13 +176,11 @@ def worker_engine(start_val, multiplier, mode, target_set, counter, found_event,
                     save_discovery_v2(current, h160_u, "Uncompressed", found_list, lock)
                     if stop_on_find: return
             
-            # --- 4. Movimento Matemático ---
             if mode == "GEOMETRIC":
                 current *= multiplier
             elif mode == "LINEAR":
-                current += multiplier # Agora suporta passo customizado
+                current += multiplier
         
-        # --- ATUALIZAÇÃO GLOBAL (Fora do Loop Crítico) ---
         with counter.get_lock():
             counter.value += BATCH_SIZE
         
@@ -235,17 +244,15 @@ def load_checkpoint():
         except: pass
     return 1
 
-# --- INPUT HELPER ---
 def get_bit_range_input():
     print(f"\n{Fore.YELLOW}[CONFIGURAÇÃO DE RANGE (Aleatório)]")
-    print("Exemplos: '66' para 2^65..2^66 | '1:256' para Full | Deixe vazio para Full")
-    val = input(f"{Fore.GREEN}>> Range (Bit ou Min:Max): ").strip()
+    print("Ex: '66' (bit 66) | '1:256' (Full) | '10:20' (Intervalo)")
+    val = input(f"{Fore.GREEN}>> Range: ").strip()
     
     start = 1
     end = MAX_KEY_LIMIT
     
-    if not val:
-        return start, end
+    if not val: return start, end
         
     if ":" in val:
         try:
@@ -261,14 +268,12 @@ def get_bit_range_input():
             start = 2**(bit-1)
             end = 2**bit
         except: pass
-    
-    print(f"{Fore.CYAN}[INFO] Range Definido: {start} ... {end}")
     return start, end
 
 # --- MAIN ---
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
-    if os.name == 'nt': os.system('title BTC GOLD PROFESSIONAL v2.1')
+    if os.name == 'nt': os.system('title BTC GOLD PROFESSIONAL v2.2')
 
     print(f"{Fore.YELLOW}{Style.BRIGHT}")
     print(r"""
@@ -278,17 +283,30 @@ def main():
     ██╔══██╗   ██║   ██║██║  ██║██╔══╝  
     ██████╔╝   ██║   ██║██████╔╝███████╗
     ╚═════╝    ╚═╝   ╚═╝╚═════╝ ╚══════╝
-    PROFESSIONAL EDITION v2.1 (TURBO BATCH)
+    PROFESSIONAL EDITION v2.2 (UNIVERSAL LOADER)
     """)
     
     cores = detect_system_specs()
-    target_set, count = load_targets_binary(TARGET_FILE)
+    
+    # --- SELETOR DE INPUT DA DATABASE ---
+    print(f"\n{Fore.YELLOW}[DATABASE INPUT FORMAT]")
+    print(f"Qual o formato dos dados em '{os.path.basename(TARGET_FILE)}'?")
+    print(f"[1] Endereços Bitcoin (1A1z...)")
+    print(f"[2] HASH160 (Hexadecimal - 40 chars)")
+    print(f"[3] Public Keys (Hexadecimal - 02/03/04...)")
+    
+    try: in_sel = input(f"{Fore.GREEN}>> Opção [1]: ").strip() or "1"
+    except: in_sel = "1"
+    
+    input_type = "ADDRESS"
+    if in_sel == "2": input_type = "HASH160"
+    elif in_sel == "3": input_type = "PUBKEY"
+
+    target_set, count = load_targets(TARGET_FILE, input_type)
     if count == 0:
-        print(f"{Fore.RED}[!] Database vazia. Adicione endereços em '{TARGET_FILE}'")
+        print(f"{Fore.RED}[!] Database vazia ou formato incorreto. Verifique '{TARGET_FILE}'")
         sys.exit()
 
-    # --- SETUP INTERATIVO ---
-    
     # 1. SCAN MODE
     print(f"\n{Fore.YELLOW}[ALVO - TIPO DE ENDEREÇO]")
     print(f"[1] Apenas Comprimidos (Recomendado/Rápido)")
@@ -330,7 +348,6 @@ def main():
             start_num = load_checkpoint()
             print(f"{Fore.CYAN}[INFO] Retomando de: {start_num}")
 
-        # Passo do Pulo (Stride)
         print(f"Pulo Padrão = {cores} (Para não repetir chaves entre cores)")
         try:
             stride_in = input(f"{Fore.GREEN}>> Multiplicador de Pulo [Enter = {cores}]: ").strip()
@@ -363,16 +380,11 @@ def main():
     shared_key_display = Array('c', 66)
     shared_key_display.value = b"Starting..."
 
-    print(f"\n{Fore.YELLOW}[*] INICIANDO ENGINE V2.1 TURBO EM {cores} CORES...")
-    print(f"{Fore.CYAN}[INFO] Batch Size: 10,000 keys/update (Menor overhead)")
+    print(f"\n{Fore.YELLOW}[*] INICIANDO ENGINE V2.2 EM {cores} CORES...")
     
     processes = []
     
-    # Distribuição inicial
     for i in range(cores):
-        # Para Sequencial: Offset inicial diferente para cada core
-        # Core 0 começa em Start, Core 1 em Start+1, etc.
-        # Todos pulam 'multiplier' a cada passo.
         w_start = start_num + i if mode == "LINEAR" else start_num
         
         p = Process(target=worker_engine, args=(
@@ -408,9 +420,7 @@ def main():
                 )
                 sys.stdout.flush()
                 
-                # Checkpoint Sequencial
                 if mode == "LINEAR" and int(elapsed) % 30 == 0:
-                     # Estimativa segura
                     save_checkpoint(start_num + (total * multiplier // cores))
 
     except KeyboardInterrupt:
