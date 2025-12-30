@@ -4,20 +4,18 @@ import time
 import json
 import secrets
 import platform
-import signal
-import ctypes
 import hashlib
 import binascii
 from multiprocessing import Process, Value, cpu_count, Event, Manager, Array
 from datetime import datetime
 
 # --- CONFIGURAÇÃO DE ALTA PERFORMANCE ---
-# Desativa garbage collector automático dentro dos workers para evitar pausas
 import gc
 
 # --- VERIFICAÇÃO DE DEPENDÊNCIAS CRÍTICAS ---
 try:
-    from coincurve import PrivateKey
+    from coincurve import PrivateKey, PublicKey
+    BACKEND = "COINCURVE"
 except ImportError:
     print("\n[CRITICAL ERROR] 'coincurve' não encontrado.")
     print("Execute: pip install -r requirements.txt")
@@ -71,169 +69,130 @@ def detect_system_specs():
 
 # --- LOADERS INTELIGENTES ---
 def load_targets_binary(file_path):
-    """
-    Carrega endereços e converte IMEDIATAMENTE para HASH160 (bytes).
-    Evita conversão base58 dentro do loop de mineração.
-    """
     targets = set()
     raw_count = 0
-    
     if not os.path.exists(file_path):
         return targets, 0
 
     print(f"{Fore.YELLOW}[*] Processando Database (Binary Mode)...")
-    
     try:
         with open(file_path, 'r') as f:
             for line in f:
                 line = line.strip()
-                if not line: continue
-                
-                # Suporte apenas a Legacy Addresses (P2PKH - Começam com 1)
-                # Script ignora Bech32 por enquanto para maximizar velocidade em legacy
-                if line.startswith("1"):
-                    try:
-                        # Decode Base58 -> Checksum Validation -> Remove Version Byte (1 byte)
-                        # Resultado: 20 bytes do Hash160
-                        full_payload = base58.b58decode_check(line)
-                        h160 = full_payload[1:] # Remove prefixo 0x00
-                        targets.add(h160)
-                        raw_count += 1
-                    except Exception:
-                        continue
-                        
+                if not line or not line.startswith("1"): continue
+                try:
+                    full_payload = base58.b58decode_check(line)
+                    h160 = full_payload[1:] 
+                    targets.add(h160)
+                    raw_count += 1
+                except: continue
         print(f"{Fore.GREEN}[OK] Otimizado: {len(targets)} Alvos únicos (HASH160 Bytes)")
         return targets, raw_count
     except Exception as e:
         print(f"{Fore.RED}[!] Erro ao processar alvos: {e}")
         return set(), 0
 
-# --- ENGINE OTIMIZADA (V2.0) ---
-def worker_engine(start_base, multiplier, mode, target_set, counter, found_event, stop_event, stop_on_find, found_list, lock, shared_key_display, core_id, scan_mode):
-    """
-    ENGINE V2.0:
-    - Zero conversões de string no loop.
-    - Zero conversões base58 no loop.
-    - Comparação Bytes vs Bytes (Hash160).
-    - Pipeline dedicado: SHA256 -> RIPEMD160.
-    """
-    
-    # Imports locais para velocidade
+# --- ENGINE OTIMIZADA (V2.1 - TURBO) ---
+def worker_engine(start_val, multiplier, mode, target_set, counter, found_event, stop_event, stop_on_find, found_list, lock, shared_key_display, core_id, scan_mode, range_end=None):
     import hashlib
     
-    # Pré-bind de funções globais para locais (Small Speedup)
+    # Otimização Crítica: Funções Locais
     sha256 = hashlib.sha256
     new_ripemd = lambda: hashlib.new('ripemd160')
     
-    # Configurações de Scan
+    # Flags Booleanas são mais rápidas que IFs complexos
     check_compressed = (scan_mode in [1, 3])
     check_uncompressed = (scan_mode in [2, 3])
     
-    current = start_base
+    # Batch Processing para reduzir Overhead de Lock/IPC
+    BATCH_SIZE = 10000 
     
-    # Cache local do set (evita overhead de IPC se fosse compartilhado, mas aqui é Copy-on-Write)
+    current = start_val
     local_targets = target_set
     
-    # Prepara buffer de exibição
-    last_update = time.time()
-    
-    # Desativa GC para loop crítico
-    gc.disable()
-    
-    batch_size = 1000
-    batch_counter = 0
+    gc.disable() 
 
     while not stop_event.is_set():
-        if stop_on_find and found_event.is_set(): 
-            break
+        if stop_on_find and found_event.is_set(): break
 
-        # Geração da Chave Privada
-        # Utiliza inteiros nativos do Python (arbitrary precision) que são rápidos
-        if mode == "RANDOM":
-            current = int.from_bytes(secrets.token_bytes(32), 'big')
+        # --- GERAÇÃO DE LOTE (BATCH) ---
+        # Processamos N chaves antes de atualizar contadores globais
+        for _ in range(BATCH_SIZE):
+            
+            # 1. Geração da Chave Privada
+            if mode == "RANDOM":
+                if range_end:
+                    # Gera dentro do Range Específico (Mais lento que full random, mas necessário)
+                    current = secrets.randbelow(range_end - start_val) + start_val
+                else:
+                    # Full Random (Mais rápido)
+                    current = int.from_bytes(secrets.token_bytes(32), 'big')
+            
+            # --- 2. Coincurve Fast Path ---
+            try:
+                # Otimização: Evitar criar objeto PrivateKey completo se possível
+                # Usamos to_bytes(32) que é nativo e rápido
+                priv_bytes = current.to_bytes(32, 'big')
+                pk = PrivateKey(priv_bytes)
+            except:
+                if mode != "RANDOM": current += 1
+                continue
+
+            # --- 3. Hashing Pipeline (O Coração da Performance) ---
+            
+            # Compressed Path
+            if check_compressed:
+                pub_c = pk.public_key.format(compressed=True)
+                # SHA256 -> RIPEMD160
+                r = new_ripemd()
+                r.update(sha256(pub_c).digest())
+                h160_c = r.digest()
+                
+                if h160_c in local_targets:
+                    found_event.set()
+                    save_discovery_v2(current, h160_c, "Compressed", found_list, lock)
+                    if stop_on_find: return
+
+            # Uncompressed Path
+            if check_uncompressed:
+                pub_u = pk.public_key.format(compressed=False)
+                r = new_ripemd()
+                r.update(sha256(pub_u).digest())
+                h160_u = r.digest()
+                
+                if h160_u in local_targets:
+                    found_event.set()
+                    save_discovery_v2(current, h160_u, "Uncompressed", found_list, lock)
+                    if stop_on_find: return
+            
+            # --- 4. Movimento Matemático ---
+            if mode == "GEOMETRIC":
+                current *= multiplier
+            elif mode == "LINEAR":
+                current += multiplier # Agora suporta passo customizado
         
-        try:
-            # Coincurve é wrapper C (libsecp256k1), extremamente rápido
-            priv_bytes = current.to_bytes(32, 'big')
-            pk = PrivateKey(priv_bytes)
-        except:
-            if mode != "RANDOM": current += 1
-            continue
+        # --- ATUALIZAÇÃO GLOBAL (Fora do Loop Crítico) ---
+        with counter.get_lock():
+            counter.value += BATCH_SIZE
+        
+        if core_id == 0:
+            try:
+                hex_str = format(current, '064x')
+                shared_key_display.value = hex_str.encode('utf-8')
+            except: pass
 
-        # --- FLUXO COMPRIMIDO ---
-        if check_compressed:
-            # Obtém bytes puros (33 bytes)
-            pub_bytes_c = pk.public_key.format(compressed=True)
-            
-            # Hash160 (SHA256 -> RIPEMD160)
-            r = new_ripemd()
-            r.update(sha256(pub_bytes_c).digest())
-            h160_c = r.digest()
-            
-            # COMPARAÇÃO BINÁRIA (O(1) lookup)
-            if h160_c in local_targets:
-                found_event.set()
-                save_discovery_v2(current, h160_c, "Compressed", found_list, lock)
-
-        # --- FLUXO DESCOMPRIMIDO ---
-        if check_uncompressed:
-            # Obtém bytes puros (65 bytes)
-            pub_bytes_u = pk.public_key.format(compressed=False)
-            
-            # Hash160
-            r = new_ripemd()
-            r.update(sha256(pub_bytes_u).digest())
-            h160_u = r.digest()
-            
-            # COMPARAÇÃO BINÁRIA
-            if h160_u in local_targets:
-                found_event.set()
-                save_discovery_v2(current, h160_u, "Uncompressed", found_list, lock)
-
-        # --- ATUALIZAÇÃO E MOVIMENTO ---
-        batch_counter += 1
-        if batch_counter >= batch_size:
-            with counter.get_lock():
-                counter.value += batch_size
-            
-            if core_id == 0:
-                # Atualiza display a cada ~0.2s para não spammar lock
-                now = time.time()
-                if now - last_update > 0.2:
-                    try:
-                        hex_str = format(current, '064x')
-                        shared_key_display.value = hex_str.encode('utf-8')
-                    except: pass
-                    last_update = now
-            
-            # Reativa GC brevemente para limpar memória se necessário
-            # gc.collect() # (Opcional: Geralmente não necessário se não criamos lixo no loop)
-            batch_counter = 0
-
-        # Movimento Matemático
-        if mode == "GEOMETRIC":
-            current *= multiplier
-        elif mode == "LINEAR":
-            current += multiplier
-
-# --- SISTEMA DE SALVAMENTO (RECONSTRUÇÃO) ---
+# --- SISTEMA DE SALVAMENTO ---
 def save_discovery_v2(private_int, h160_bytes, type_found, found_list, lock):
-    """
-    Reconstrói os dados legíveis apenas quando encontra algo.
-    """
     priv_hex = format(private_int, '064x')
-    
     with lock:
         if priv_hex in found_list: return
         found_list.append(priv_hex)
     
-    # Reconstrução para display (Lento, mas só roda 1 vez na vida)
     version_byte = b'\x00'
     payload = version_byte + h160_bytes
     checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
     address_str = base58.b58encode(payload + checksum).decode()
     
-    # Gera WIFs
     wif_c = generate_wif(priv_hex, compressed=True)
     wif_u = generate_wif(priv_hex, compressed=False)
 
@@ -257,16 +216,12 @@ def save_discovery_v2(private_int, h160_bytes, type_found, found_list, lock):
 
 def generate_wif(priv_hex, compressed=True):
     import hashlib, base58
-    if compressed:
-        extended = bytes.fromhex("80" + priv_hex + "01")
-    else:
-        extended = bytes.fromhex("80" + priv_hex)
-    
+    suffix = "01" if compressed else ""
+    extended = bytes.fromhex("80" + priv_hex + suffix)
     first = hashlib.sha256(extended).digest()
     chk = hashlib.sha256(first).digest()[:4]
     return base58.b58encode(extended + chk).decode()
 
-# --- CHECKPOINTS ---
 def save_checkpoint(val):
     try:
         with open(CHECKPOINT_FILE, "w") as f:
@@ -280,10 +235,40 @@ def load_checkpoint():
         except: pass
     return 1
 
+# --- INPUT HELPER ---
+def get_bit_range_input():
+    print(f"\n{Fore.YELLOW}[CONFIGURAÇÃO DE RANGE (Aleatório)]")
+    print("Exemplos: '66' para 2^65..2^66 | '1:256' para Full | Deixe vazio para Full")
+    val = input(f"{Fore.GREEN}>> Range (Bit ou Min:Max): ").strip()
+    
+    start = 1
+    end = MAX_KEY_LIMIT
+    
+    if not val:
+        return start, end
+        
+    if ":" in val:
+        try:
+            parts = val.split(":")
+            bit_min = int(parts[0])
+            bit_max = int(parts[1])
+            start = 2**(bit_min-1)
+            end = 2**bit_max
+        except: pass
+    else:
+        try:
+            bit = int(val)
+            start = 2**(bit-1)
+            end = 2**bit
+        except: pass
+    
+    print(f"{Fore.CYAN}[INFO] Range Definido: {start} ... {end}")
+    return start, end
+
 # --- MAIN ---
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
-    if os.name == 'nt': os.system('title BTC GOLD PROFESSIONAL v2.0')
+    if os.name == 'nt': os.system('title BTC GOLD PROFESSIONAL v2.1')
 
     print(f"{Fore.YELLOW}{Style.BRIGHT}")
     print(r"""
@@ -293,75 +278,82 @@ def main():
     ██╔══██╗   ██║   ██║██║  ██║██╔══╝  
     ██████╔╝   ██║   ██║██████╔╝███████╗
     ╚═════╝    ╚═╝   ╚═╝╚═════╝ ╚══════╝
-    PROFESSIONAL EDITION v2.0 (BINARY ENGINE)
+    PROFESSIONAL EDITION v2.1 (TURBO BATCH)
     """)
     
     cores = detect_system_specs()
-    
-    # 1. Carregamento Otimizado
     target_set, count = load_targets_binary(TARGET_FILE)
     if count == 0:
-        print(f"{Fore.RED}[!] Nenhum alvo válido encontrado em '{TARGET_FILE}'.")
-        print("Crie o arquivo com endereços P2PKH (começando com 1).")
-        with open(TARGET_FILE, 'w') as f:
-            f.write("1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH\n")
+        print(f"{Fore.RED}[!] Database vazia. Adicione endereços em '{TARGET_FILE}'")
         sys.exit()
 
-    # 2. Configuração de Modo de Scan
-    print(f"\n{Fore.YELLOW}[CONFIGURAÇÃO DE ALVO]")
-    print(f"{Fore.WHITE}[1] Apenas Comprimidos (Padrão Moderno - Mais Rápido)")
-    print(f"{Fore.WHITE}[2] Apenas Descomprimidos (Legado)")
-    print(f"{Fore.WHITE}[3] AMBOS (Verificação Dupla - Mais Lento)")
+    # --- SETUP INTERATIVO ---
     
-    try:
-        scan_choice = input(f"{Fore.GREEN}>> Escolha [1-3]: ").strip()
-        scan_mode = int(scan_choice) if scan_choice in ['1','2','3'] else 1
-    except: scan_mode = 1
+    # 1. SCAN MODE
+    print(f"\n{Fore.YELLOW}[ALVO - TIPO DE ENDEREÇO]")
+    print(f"[1] Apenas Comprimidos (Recomendado/Rápido)")
+    print(f"[2] Apenas Descomprimidos")
+    print(f"[3] AMBOS")
+    try: s_in = input(f"{Fore.GREEN}>> Opção [1]: ").strip() or "1"
+    except: s_in = "1"
+    scan_mode = int(s_in) if s_in in ['1','2','3'] else 1
 
-    # 3. Configuração de Movimento
+    # 2. STOP ON FIND
+    print(f"\n{Fore.YELLOW}[PARADA AUTOMÁTICA]")
+    print(f"[S] Parar ao encontrar primeiro resultado")
+    print(f"[N] Continuar minerando infinitamente (Padrão)")
+    stop_choice = input(f"{Fore.GREEN}>> Opção [N]: ").strip().upper()
+    stop_on_find = (stop_choice == 'S')
+
+    # 3. OPERATION MODE
     print(f"\n{Fore.YELLOW}[MODO DE OPERAÇÃO]")
-    print(f"{Fore.WHITE}1. {Fore.CYAN}SEQUENCIAL {Fore.WHITE}(Range Attack)")
-    print(f"{Fore.WHITE}2. {Fore.CYAN}RANDOM {Fore.WHITE}(Sorte Absoluta)")
-    print(f"{Fore.WHITE}3. {Fore.CYAN}GEOMÉTRICO {Fore.WHITE}(Multiplicação)")
-    
-    try:
-        mode_choice = input(f"\n{Fore.GREEN}>> Selecione: ").strip()
+    print(f"1. SEQUENCIAL {Fore.CYAN}(Range Attack)")
+    print(f"2. RANDOM {Fore.CYAN}(Range Aleatório)")
+    print(f"3. GEOMÉTRICO {Fore.CYAN}(Multiplicação)")
+    try: m_in = input(f"{Fore.GREEN}>> Selecione: ").strip()
     except: sys.exit()
 
     start_num = 1
     mode = "LINEAR"
     multiplier = 1
+    range_end = None
 
-    if mode_choice == "1":
+    if m_in == "1": # SEQUENCIAL
         mode = "LINEAR"
         print(f"\n{Fore.YELLOW}[CONFIG SEQUENCIAL]")
-        print("Deixe vazio para continuar do Checkpoint ou digite o BIT (ex: 66).")
-        bit_in = input(f"{Fore.GREEN}>> Bit Inicial: ")
+        print("Digite o BIT inicial (ex: 66) ou ENTER para Checkpoint")
+        bit_in = input(f"{Fore.GREEN}>> Bit Inicial: ").strip()
         
-        if bit_in.strip():
-            try: start_num = 2 ** (int(bit_in) - 1)
-            except: start_num = 1
+        if bit_in:
+            start_num = 2**(int(bit_in)-1)
         else:
-            cp = load_checkpoint()
-            if cp > 1:
-                print(f"{Fore.CYAN}[*] Retomando do checkpoint: {cp}")
-                start_num = cp
+            start_num = load_checkpoint()
+            print(f"{Fore.CYAN}[INFO] Retomando de: {start_num}")
 
-        # Distribuição de Carga para Sequencial
-        # Cada core pega um range: Core 0 (0..1M), Core 1 (1M..2M)...
-        # Para evitar overlap, usamos um "Stride" gigante
-        # Mas a implementação mais simples é cada worker ter seu offset fixo
-        # E todos incrementarem por (CORES * 1)
-        multiplier = cores
+        # Passo do Pulo (Stride)
+        print(f"Pulo Padrão = {cores} (Para não repetir chaves entre cores)")
+        try:
+            stride_in = input(f"{Fore.GREEN}>> Multiplicador de Pulo [Enter = {cores}]: ").strip()
+            multiplier = int(stride_in) if stride_in else cores
+        except: multiplier = cores
 
-    elif mode_choice == "2":
+    elif m_in == "2": # RANDOM
         mode = "RANDOM"
-
-    elif mode_choice == "3":
+        start_num, range_end = get_bit_range_input()
+        
+    elif m_in == "3": # GEOMETRICO
         mode = "GEOMETRIC"
-        multiplier = 2 # Padrão dobrar
+        print(f"\n{Fore.YELLOW}[CONFIG GEOMÉTRICA]")
+        print("Digite BIT inicial (ex: 1) e o Fator Multiplicador")
+        bit_in = input(f"{Fore.GREEN}>> Bit Inicial [1]: ").strip()
+        start_num = 2**(int(bit_in)-1) if bit_in else 1
+        
+        try:
+            mult_in = input(f"{Fore.GREEN}>> Fator Multiplicador [2]: ").strip()
+            multiplier = int(mult_in) if mult_in else 2
+        except: multiplier = 2
 
-    # 4. Execução
+    # --- EXECUÇÃO ---
     manager = Manager()
     found_list = manager.list()
     lock = manager.Lock()
@@ -371,18 +363,21 @@ def main():
     shared_key_display = Array('c', 66)
     shared_key_display.value = b"Starting..."
 
-    print(f"\n{Fore.YELLOW}[*] INICIANDO ENGINE V2.0 EM {cores} NÚCLEOS...")
+    print(f"\n{Fore.YELLOW}[*] INICIANDO ENGINE V2.1 TURBO EM {cores} CORES...")
+    print(f"{Fore.CYAN}[INFO] Batch Size: 10,000 keys/update (Menor overhead)")
     
     processes = []
     
-    # Distribuição inicial das sementes
+    # Distribuição inicial
     for i in range(cores):
-        # Seed inicial diferente para cada worker
-        worker_start = start_num + i 
+        # Para Sequencial: Offset inicial diferente para cada core
+        # Core 0 começa em Start, Core 1 em Start+1, etc.
+        # Todos pulam 'multiplier' a cada passo.
+        w_start = start_num + i if mode == "LINEAR" else start_num
         
         p = Process(target=worker_engine, args=(
-            worker_start, multiplier, mode, target_set, counter, 
-            found_event, stop_event, True, found_list, lock, shared_key_display, i, scan_mode
+            w_start, multiplier, mode, target_set, counter, 
+            found_event, stop_event, stop_on_find, found_list, lock, shared_key_display, i, scan_mode, range_end
         ))
         p.daemon = True
         p.start()
@@ -393,8 +388,8 @@ def main():
     try:
         while True:
             time.sleep(0.5)
-            if found_event.is_set():
-                time.sleep(2) # Espera printar
+            if stop_on_find and found_event.is_set():
+                time.sleep(1)
                 break
                 
             elapsed = time.time() - start_time
@@ -402,30 +397,26 @@ def main():
             
             if elapsed > 0:
                 hps = total / elapsed
-                
-                # Formatação visual profissional
                 try: hex_view = shared_key_display.value.decode('utf-8')
                 except: hex_view = "SYNC"
                 
-                status_bar = (
-                    f"\r{Fore.BLUE}[RUNNING]{Fore.RESET} "
-                    f"Speed: {Fore.GREEN}{hps:,.0f} keys/s{Fore.RESET} | "
-                    f"Total: {Fore.WHITE}{total:,}{Fore.RESET} | "
-                    f"Last Key: {Fore.YELLOW}{hex_view[-16:]}...{Fore.RESET}"
+                sys.stdout.write(
+                    f"\r{Fore.BLUE}[RUNNING] "
+                    f"Speed: {Fore.GREEN}{hps:,.0f} k/s "
+                    f"{Fore.WHITE}| Found: {len(found_list)} "
+                    f"| {hex_view[-16:]}..."
                 )
-                sys.stdout.write(status_bar)
                 sys.stdout.flush()
                 
-                # Checkpoint automático a cada minuto
-                if mode == "LINEAR" and int(elapsed) % 60 == 0:
-                    # Salva a chave mais provável (base + total)
-                    # Não é exato por causa do multiprocessamento, mas serve de base segura
-                    save_checkpoint(start_num + (total * multiplier))
+                # Checkpoint Sequencial
+                if mode == "LINEAR" and int(elapsed) % 30 == 0:
+                     # Estimativa segura
+                    save_checkpoint(start_num + (total * multiplier // cores))
 
     except KeyboardInterrupt:
-        print(f"\n\n{Fore.RED}[!] Interrupção detectada. Salvando e saindo...")
+        print(f"\n\n{Fore.RED}[!] Parando...")
         if mode == "LINEAR":
-            save_checkpoint(start_num + (counter.value * multiplier))
+            save_checkpoint(start_num + (counter.value * multiplier // cores))
             
     finally:
         stop_event.set()
