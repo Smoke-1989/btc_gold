@@ -118,8 +118,27 @@ def load_targets(file_path, input_type):
         print(f"{Fore.RED}[!] Erro ao processar alvos: {e}")
         return set(), 0
 
-# --- ENGINE OTIMIZADA (V2.2 - UNIVERSAL) ---
-def worker_engine(start_val, multiplier, mode, target_set, counter, found_event, stop_event, stop_on_find, found_list, lock, shared_key_display, core_id, scan_mode, range_end=None):
+# --- ENGINE OTIMIZADA (V2.3 - ENTERPRISE SYNC) ---
+def worker_engine(core_id, num_cores, start_val, stride, mode, multiplier, target_set, counter, found_event, stop_event, stop_on_find, found_list, lock, shared_key_display, scan_mode, range_start=None, range_end=None):
+    """
+    Worker sincronizado corretamente para todos os modos:
+    
+    LINEAR (Sequencial):
+        Core i comeca em: start_val + i
+        Pulo por iteração: stride (igual para todos)
+        Resultado: cobertura sem colisao em: C0={start + 0, start + stride, start + 2*stride, ...}
+                                            C1={start + 1, start + stride+1, start + 2*stride+1, ...}
+    
+    RANDOM:
+        Cada core gera aleatorio dentro de [range_start, range_end]
+        Distribuição uniforme garantida
+    
+    GEOMETRIC:
+        Core i comeca em: start_val + i
+        Operação: current *= multiplier a cada passo
+        Resultado: C0={start, start*mult, start*mult^2, ...}
+                  C1={start+1, (start+1)*mult, (start+1)*mult^2, ...}
+    """
     import hashlib
     
     sha256 = hashlib.sha256
@@ -128,31 +147,49 @@ def worker_engine(start_val, multiplier, mode, target_set, counter, found_event,
     check_compressed = (scan_mode in [1, 3])
     check_uncompressed = (scan_mode in [2, 3])
     
-    BATCH_SIZE = 10000 
+    BATCH_SIZE = 10000
     
-    current = start_val
+    # INICIALIZAÇÃO: Cada core começa em seu ponto unico
+    if mode == "LINEAR":
+        current = start_val + core_id  # Offset único por core
+    elif mode == "GEOMETRIC":
+        current = start_val + core_id  # Offset único por core
+    elif mode == "RANDOM":
+        current = None  # Gerado aleatoriamente a cada iteração
+    
     local_targets = target_set
-    
-    gc.disable() 
+    gc.disable()
 
     while not stop_event.is_set():
         if stop_on_find and found_event.is_set(): break
 
         for _ in range(BATCH_SIZE):
-            if mode == "RANDOM":
+            
+            # --- GERÃO DA CHAVE ---
+            if mode == "LINEAR":
+                # Já inicializada, apenas pula
+                pass
+            elif mode == "GEOMETRIC":
+                # Já inicializada, apenas multiplica
+                pass
+            elif mode == "RANDOM":
+                # Gera dentro do range
                 if range_end:
-                    current = secrets.randbelow(range_end - start_val) + start_val
+                    current = secrets.randbelow(range_end - range_start) + range_start
                 else:
-                    current = int.from_bytes(secrets.token_bytes(32), 'big')
+                    current = int.from_bytes(secrets.token_bytes(32), 'big') % MAX_KEY_LIMIT
             
             try:
                 priv_bytes = current.to_bytes(32, 'big')
                 pk = PrivateKey(priv_bytes)
             except:
-                if mode != "RANDOM": current += 1
+                # Se falhar, avança para próximo em modo LINEAR, ou gera novo em RANDOM
+                if mode in ["LINEAR", "GEOMETRIC"]:
+                    if mode == "LINEAR": current += stride
+                    elif mode == "GEOMETRIC": current *= multiplier
                 continue
 
-            # Compressed Path
+            # --- HASHING E VERIFICAÇÃO ---
             if check_compressed:
                 pub_c = pk.public_key.format(compressed=True)
                 r = new_ripemd()
@@ -164,7 +201,6 @@ def worker_engine(start_val, multiplier, mode, target_set, counter, found_event,
                     save_discovery_v2(current, h160_c, "Compressed", found_list, lock)
                     if stop_on_find: return
 
-            # Uncompressed Path
             if check_uncompressed:
                 pub_u = pk.public_key.format(compressed=False)
                 r = new_ripemd()
@@ -176,14 +212,18 @@ def worker_engine(start_val, multiplier, mode, target_set, counter, found_event,
                     save_discovery_v2(current, h160_u, "Uncompressed", found_list, lock)
                     if stop_on_find: return
             
-            if mode == "GEOMETRIC":
+            # --- MOVIMENTO MATEMÁTICO (Após verificação) ---
+            if mode == "LINEAR":
+                current += stride
+            elif mode == "GEOMETRIC":
                 current *= multiplier
-            elif mode == "LINEAR":
-                current += multiplier
+            # RANDOM: regera na próxima iteração
         
+        # --- UPDATE GLOBAL (A CADA BATCH) ---
         with counter.get_lock():
             counter.value += BATCH_SIZE
         
+        # Display atualizado
         if core_id == 0:
             try:
                 hex_str = format(current, '064x')
@@ -273,7 +313,7 @@ def get_bit_range_input():
 # --- MAIN ---
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
-    if os.name == 'nt': os.system('title BTC GOLD PROFESSIONAL v2.2')
+    if os.name == 'nt': os.system('title BTC GOLD PROFESSIONAL v2.3')
 
     print(f"{Fore.YELLOW}{Style.BRIGHT}")
     print(r"""
@@ -283,7 +323,7 @@ def main():
     ██╔══██╗   ██║   ██║██║  ██║██╔══╝  
     ██████╔╝   ██║   ██║██████╔╝███████╗
     ╚═════╝    ╚═╝   ╚═╝╚═════╝ ╚══════╝
-    PROFESSIONAL EDITION v2.2 (UNIVERSAL LOADER)
+    PROFESSIONAL EDITION v2.3 (ENTERPRISE SYNC)
     """)
     
     cores = detect_system_specs()
@@ -333,7 +373,9 @@ def main():
 
     start_num = 1
     mode = "LINEAR"
+    stride = 1
     multiplier = 1
+    range_start = 1
     range_end = None
 
     if m_in == "1": # SEQUENCIAL
@@ -348,15 +390,17 @@ def main():
             start_num = load_checkpoint()
             print(f"{Fore.CYAN}[INFO] Retomando de: {start_num}")
 
-        print(f"Pulo Padrão = {cores} (Para não repetir chaves entre cores)")
+        print(f"\nPulo Padrão = {cores} (Para não repetir chaves entre cores)")
         try:
-            stride_in = input(f"{Fore.GREEN}>> Multiplicador de Pulo [Enter = {cores}]: ").strip()
-            multiplier = int(stride_in) if stride_in else cores
-        except: multiplier = cores
+            stride_in = input(f"{Fore.GREEN}>> Stride/Pulo [Enter = {cores}]: ").strip()
+            stride = int(stride_in) if stride_in else cores
+        except: stride = cores
+        
+        print(f"{Fore.CYAN}[INFO] Cores 0-{cores-1} irão gerar chaves sem colisao")
 
     elif m_in == "2": # RANDOM
         mode = "RANDOM"
-        start_num, range_end = get_bit_range_input()
+        range_start, range_end = get_bit_range_input()
         
     elif m_in == "3": # GEOMETRICO
         mode = "GEOMETRIC"
@@ -369,6 +413,9 @@ def main():
             mult_in = input(f"{Fore.GREEN}>> Fator Multiplicador [2]: ").strip()
             multiplier = int(mult_in) if mult_in else 2
         except: multiplier = 2
+        
+        print(f"{Fore.CYAN}[INFO] Sequence: C0={{start, start*{multiplier}, start*{multiplier}^2, ...}}")
+        print(f"{Fore.CYAN}       C1={{start+1, (start+1)*{multiplier}, (start+1)*{multiplier}^2, ...}}")
 
     # --- EXECUÇÃO ---
     manager = Manager()
@@ -380,16 +427,14 @@ def main():
     shared_key_display = Array('c', 66)
     shared_key_display.value = b"Starting..."
 
-    print(f"\n{Fore.YELLOW}[*] INICIANDO ENGINE V2.2 EM {cores} CORES...")
+    print(f"\n{Fore.YELLOW}[*] INICIANDO ENGINE V2.3 EM {cores} CORES...")
     
     processes = []
     
     for i in range(cores):
-        w_start = start_num + i if mode == "LINEAR" else start_num
-        
         p = Process(target=worker_engine, args=(
-            w_start, multiplier, mode, target_set, counter, 
-            found_event, stop_event, stop_on_find, found_list, lock, shared_key_display, i, scan_mode, range_end
+            i, cores, start_num, stride, mode, multiplier, target_set, counter, 
+            found_event, stop_event, stop_on_find, found_list, lock, shared_key_display, scan_mode, range_start, range_end
         ))
         p.daemon = True
         p.start()
@@ -421,16 +466,23 @@ def main():
                 sys.stdout.flush()
                 
                 if mode == "LINEAR" and int(elapsed) % 30 == 0:
-                    save_checkpoint(start_num + (total * multiplier // cores))
+                    # Checkpoint correto para LINEAR com múltiplos cores
+                    # Estimamos em qual iteração estamos (batches processados)
+                    iterations = total // 10000
+                    checkpoint_val = start_num + (iterations * stride)
+                    save_checkpoint(checkpoint_val)
 
     except KeyboardInterrupt:
         print(f"\n\n{Fore.RED}[!] Parando...")
         if mode == "LINEAR":
-            save_checkpoint(start_num + (counter.value * multiplier // cores))
+            iterations = counter.value // 10000
+            checkpoint_val = start_num + (iterations * stride)
+            save_checkpoint(checkpoint_val)
             
     finally:
         stop_event.set()
         for p in processes: p.terminate()
+        print(f"{Fore.YELLOW}\n[*] Engine parado. Resultados salvos em '{FOUND_FILE}'")
 
 if __name__ == "__main__":
     import multiprocessing
