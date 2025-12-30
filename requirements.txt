@@ -1,4 +1,12 @@
-coincurve>=18.0.0
-base58>=2.1.0
-colorama>=0.4.6
-psutil>=5.9.0
+# --- DEPENDENCIAS CRITICAS ---
+coincurve==19.0.0
+base58==2.1.1
+colorama==0.4.6
+psutil==5.9.8
+
+# --- OPCIONAL: ACELERACAO NUMBA JIT ---
+# Descomente para ganhar 2-5x em performance (requer LLVM compiler)
+# numba==0.59.1
+
+# --- OPCIONAL: PROCESSAMENTO PARALELO AVANCADO ---
+# rayon-rs poderia ajudar em implementacoes Rust futuras
